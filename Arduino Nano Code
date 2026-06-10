@@ -1,0 +1,284 @@
+/*
+ * ============================================================
+ *  Line Follower + IMU + Ultrasonic + ESP32-CAM
+ *  Target: Arduino NANO — Hardware Serial (pins 0/1) only
+ *
+ *  Receives "right" from ESP32 → pivot right immediately.
+ *  IMU data printed every 200ms.
+ * ============================================================
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU6050.h>
+
+// ============================================================
+//  MOTOR PINS (TB6612FNG)
+// ============================================================
+const int PWMA = 3;
+const int AIN1 = 5;
+const int AIN2 = 4;
+const int PWMB = 9;
+const int BIN1 = 7;
+const int BIN2 = 8;
+const int STBY = 6;
+
+// ============================================================
+//  IR SENSOR PINS
+// ============================================================
+const int IR_S1 = 13;   // far-left
+const int IR_S2 = 2;    // mid-left
+const int IR_S3 = 10;   // center
+const int IR_S4 = 11;   // mid-right
+const int IR_S5 = 12;   // far-right
+
+// ============================================================
+//  ULTRASONIC
+// ============================================================
+const int trigPin      = A1;
+const int echoPin      = A2;
+const int STOP_DIST_CM = 15;
+
+// ============================================================
+//  SPEED SETTINGS (match L298N code ratios)
+// ============================================================
+const int MAX_SPEED  = 150;   // cruising speed
+const int TURN_SPEED = 130;   // sharp turn speed
+
+// ============================================================
+//  MPU6050
+// ============================================================
+MPU6050 mpu;
+
+// ============================================================
+//  GLOBAL STATE
+// ============================================================
+int   s1, s2, s3, s4, s5;
+int   dist = 0;
+float pitch = 0.0f;
+float roll  = 0.0f;
+
+volatile bool rightCommandReceived = false;
+unsigned long lastPrintTime = 0;
+const unsigned long PRINT_INTERVAL_MS = 200;
+
+// ============================================================
+//  MOTOR HELPERS (TB6612)
+// ============================================================
+void enableDriver() { digitalWrite(STBY, HIGH); }
+
+void setMotorLeft(int spd, bool fwd) {
+  digitalWrite(AIN1, fwd ? HIGH : LOW);
+  digitalWrite(AIN2, fwd ? LOW  : HIGH);
+  analogWrite(PWMA, constrain(spd, 0, 255));
+}
+
+void setMotorRight(int spd, bool fwd) {
+  digitalWrite(BIN1, fwd ? HIGH : LOW);
+  digitalWrite(BIN2, fwd ? LOW  : HIGH);
+  analogWrite(PWMB, constrain(spd, 0, 255));
+}
+
+void stopMotors() {
+  setMotorLeft(0, true);
+  setMotorRight(0, true);
+}
+
+// ============================================================
+//  MOVEMENT ACTIONS (adapted from L298N code)
+// ============================================================
+void moveForward(int speed) {
+  setMotorLeft(speed, true);
+  setMotorRight(speed, true);
+}
+
+void moveForwardSmooth(int leftSpeed, int rightSpeed) {
+  setMotorLeft(leftSpeed, true);
+  setMotorRight(rightSpeed, true);
+}
+
+void turnLeft(int speed) {
+  setMotorLeft(speed, false);   // left reverse
+  setMotorRight(speed, true);   // right forward
+}
+
+void turnRight(int speed) {
+  setMotorLeft(speed, true);    // left forward
+  setMotorRight(speed, false);  // right reverse
+}
+
+// Pivot right (ESP32 command) – same as original
+void espPivotRight() {
+  setMotorLeft(TURN_SPEED, true);
+  setMotorRight(TURN_SPEED, false);
+  delay(1000);                  // calibrated for ~90° turn
+  stopMotors();
+  delay(100);
+}
+
+// ============================================================
+//  READ IR SENSORS (black = HIGH)
+// ============================================================
+void readSensors() {
+  s1 = digitalRead(IR_S1) == HIGH;
+  s2 = digitalRead(IR_S2) == HIGH;
+  s3 = digitalRead(IR_S3) == HIGH;
+  s4 = digitalRead(IR_S4) == HIGH;
+  s5 = digitalRead(IR_S5) == HIGH;
+}
+
+// ============================================================
+//  READ ULTRASONIC DISTANCE
+// ============================================================
+int readDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long dur = pulseIn(echoPin, HIGH, 25000UL);
+  return (dur == 0) ? 999 : (int)(dur * 0.034f / 2.0f);
+}
+
+// ============================================================
+//  READ MPU6050
+// ============================================================
+void readIMU() {
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  pitch = atan2(-(float)ax,
+                sqrtf((float)ay * ay + (float)az * az)) * 180.0f / PI;
+  roll  = atan2f((float)ay, (float)az) * 180.0f / PI;
+}
+
+// ============================================================
+//  CHECK FOR "right" COMMAND FROM ESP32 (NON‑BLOCKING)
+// ============================================================
+void checkForRightCommand() {
+  static String incoming = "";
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (incoming == "right") {
+        rightCommandReceived = true;
+        Serial.println("[INFO] Right command received from ESP32");
+      }
+      incoming = "";
+    } else {
+      incoming += c;
+    }
+  }
+}
+
+// ============================================================
+//  PRINT IMU DATA PERIODICALLY
+// ============================================================
+void printIMUData() {
+  unsigned long now = millis();
+  if (now - lastPrintTime >= PRINT_INTERVAL_MS) {
+    lastPrintTime = now;
+    Serial.print("IMU -> Pitch: ");
+    Serial.print(pitch);
+    Serial.print("°, Roll: ");
+    Serial.println(roll);
+  }
+}
+
+// ============================================================
+//  LINE FOLLOWING LOGIC (copied from working L298N code)
+// ============================================================
+void lineFollow() {
+  // Center sensor on line
+  if (s3 == 1 && s2 == 0 && s4 == 0) {
+    moveForward(MAX_SPEED);
+  }
+  // Line drifting right -> turn left
+  else if ((s2 == 1 || s1 == 1) && s5 == 0) {
+    if (s1 == 1)
+      turnLeft(TURN_SPEED);          // sharp left
+    else
+      moveForwardSmooth(TURN_SPEED / 2, MAX_SPEED); // soft left
+  }
+  // Line drifting left -> turn right
+  else if ((s4 == 1 || s5 == 1) && s1 == 0) {
+    if (s5 == 1)
+      turnRight(TURN_SPEED);         // sharp right
+    else
+      moveForwardSmooth(MAX_SPEED, TURN_SPEED / 2); // soft right
+  }
+  // All sensors see black (intersection / thick line)
+  else if (s1 && s2 && s3 && s4 && s5) {
+    moveForward(MAX_SPEED - 30);
+  }
+  // No line detected -> stop (safety)
+  else if (s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0 && s5 == 0) {
+    stopMotors();
+  }
+  // Fallback (should not happen) – keep last action
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  mpu.initialize();
+  mpu.setSleepEnabled(false);
+
+  pinMode(STBY, OUTPUT);
+  pinMode(PWMA, OUTPUT); pinMode(PWMB, OUTPUT);
+  pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+  enableDriver();
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  pinMode(IR_S1, INPUT_PULLUP);
+  pinMode(IR_S2, INPUT_PULLUP);
+  pinMode(IR_S3, INPUT_PULLUP);
+  pinMode(IR_S4, INPUT_PULLUP);
+  pinMode(IR_S5, INPUT_PULLUP);
+
+  Serial.println("[INFO] System ready – line following (black=HIGH) + IMU + obstacle avoidance + right command");
+  delay(3000);
+}
+
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+void loop() {
+  // 1. Check for ESP32 "right" command (highest priority)
+  checkForRightCommand();
+  if (rightCommandReceived) {
+    espPivotRight();
+    rightCommandReceived = false;
+    delay(100);
+    return;   // skip obstacle & line following for one cycle
+  }
+
+  // 2. Obstacle avoidance
+  dist = readDistance();
+  if (dist > 0 && dist < STOP_DIST_CM) {
+    stopMotors();
+    do {
+      delay(50);
+      dist = readDistance();
+      checkForRightCommand();
+      if (rightCommandReceived) return;
+    } while (dist > 0 && dist < STOP_DIST_CM);
+    delay(150);
+    return;
+  }
+
+  // 3. Read sensors
+  readSensors();
+  readIMU();
+
+  // 4. Print IMU data periodically
+  printIMUData();
+
+  // 5. Follow the line
+  lineFollow();
+}
