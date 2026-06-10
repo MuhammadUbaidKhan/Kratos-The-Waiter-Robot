@@ -1,0 +1,445 @@
+/*
+ * =====================================================================
+ *  ESP32 Multi-Sensor System
+ *  - ACS712 Current Sensor     → GPIO 2  (ADC)
+ *  - Voltage Sensor (Divider)  → GPIO 15 (ADC)
+ *  - OLED SSD1306 I2C          → SDA: GPIO 0 | SCL: GPIO 4
+ *  - TCS3200 Color Sensor      → S0: GPIO 25 | S1: GPIO 26
+ *                                S2: GPIO 27 | S3: GPIO 14
+ *                                OUT: GPIO 12
+ *  - Optical Encoder 1         → GPIO 21 (interrupt)
+ *  - Optical Encoder 2         → GPIO 35 (interrupt)
+ * =====================================================================
+ *
+ *  SERIAL COMMUNICATION:
+ *    Serial2 (RX:17, TX:16) ← receives from ESP32‑CAM
+ *    Serial  (UART0, default pins) → sends to Arduino Nano
+ *
+ *  IMPORTANT: Serial (UART0) is used for Nano communication.
+ *    When the Nano is connected, the USB serial monitor cannot be used.
+ *    (Disconnect Nano to debug via USB.)
+ * =====================================================================
+ */
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ── OLED Configuration ─────────────────────────────────────────────
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define OLED_ADDRESS   0x3C
+#define SDA_PIN        0
+#define SCL_PIN        4
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ── ACS712 Current Sensor ──────────────────────────────────────────
+#define CURRENT_SENSOR_PIN  2
+#define ACS712_SENSITIVITY  0.185f   // V/A (5A model); 20A→0.100, 30A→0.066
+#define ACS712_ZERO_OFFSET  2.5f     // Volts at 0A on 5V supply
+#define ADC_VREF            3.3f
+#define ADC_RESOLUTION      4095.0f
+#define CURRENT_SAMPLES     200
+
+// ── Voltage Sensor ─────────────────────────────────────────────────
+#define VOLTAGE_SENSOR_PIN     15
+#define VOLTAGE_DIVIDER_RATIO  5.0f  // R1=30kΩ, R2=7.5kΩ → ratio=5
+#define VOLTAGE_SAMPLES        50
+
+// ── TCS3200 Color Sensor ───────────────────────────────────────────
+#define TCS_S0   25
+#define TCS_S1   26
+#define TCS_S2   27
+#define TCS_S3   14
+#define TCS_OUT  12
+#define TCS_TIMEOUT  100000   // µs
+
+// ── Optical Encoders ───────────────────────────────────────────────
+#define ENC1_PIN  21   // Supports internal pull-up; interrupt capable
+#define ENC2_PIN  35   // Input-only pin; no internal pull-up available
+
+#define ENC_PULSES_PER_REV  20
+#define RPM_INTERVAL_MS  500
+
+volatile uint32_t enc1PulseCount = 0;
+volatile uint32_t enc2PulseCount = 0;
+
+uint32_t enc1LastCount = 0;
+uint32_t enc2LastCount = 0;
+unsigned long lastRpmCalc = 0;
+
+float enc1RPM = 0.0f;
+float enc2RPM = 0.0f;
+
+void IRAM_ATTR enc1ISR() { enc1PulseCount++; }
+void IRAM_ATTR enc2ISR() { enc2PulseCount++; }
+
+// ── Serial2 pins (ESP32‑CAM) ───────────────────────────────────────
+#define CAM_RX  17
+#define CAM_TX  16
+
+// ── Display Pages ──────────────────────────────────────────────────
+#define PAGE_POWER    0
+#define PAGE_COLOR    1
+#define PAGE_ENCODER  2
+#define PAGES         3
+
+uint8_t currentPage = PAGE_POWER;
+unsigned long lastPageSwitch = 0;
+#define PAGE_DURATION_MS  4000
+
+// ── Globals ────────────────────────────────────────────────────────
+float    voltage   = 0.0f;
+float    current   = 0.0f;
+float    power     = 0.0f;
+uint32_t rawRed    = 0;
+uint32_t rawGreen  = 0;
+uint32_t rawBlue   = 0;
+String   colorName = "---";
+
+// =====================================================================
+//  SETUP
+// =====================================================================
+void setup() {
+  // Serial (UART0) used for Nano – will also appear on USB serial monitor
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n[ESP32 Multi-Sensor System] Starting...");
+
+  // Serial2 for receiving commands from ESP32‑CAM
+  Serial2.begin(9600, SERIAL_8N1, CAM_RX, CAM_TX);
+
+  // ── Custom I2C pins ─────────────────────────────────────────────
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // ── OLED Init ───────────────────────────────────────────────────
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println("ERROR: OLED not found! Check wiring.");
+    while (true) delay(1000);
+  }
+  display.clearDisplay();
+  splashScreen();
+
+  // ── ADC Pins ────────────────────────────────────────────────────
+  pinMode(CURRENT_SENSOR_PIN, INPUT);
+  pinMode(VOLTAGE_SENSOR_PIN, INPUT);
+
+  // ── TCS3200 Pins ────────────────────────────────────────────────
+  pinMode(TCS_S0, OUTPUT);
+  pinMode(TCS_S1, OUTPUT);
+  pinMode(TCS_S2, OUTPUT);
+  pinMode(TCS_S3, OUTPUT);
+  pinMode(TCS_OUT, INPUT);
+  digitalWrite(TCS_S0, HIGH);
+  digitalWrite(TCS_S1, LOW);
+
+  // ── Optical Encoder Pins & Interrupts ───────────────────────────
+  pinMode(ENC1_PIN, INPUT_PULLUP);
+  pinMode(ENC2_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(ENC1_PIN), enc1ISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC2_PIN), enc2ISR, RISING);
+
+  lastRpmCalc = millis();
+  Serial.println("[SETUP] Complete.");
+}
+
+// =====================================================================
+//  LOOP
+// =====================================================================
+void loop() {
+  // ── Sensor Reads ────────────────────────────────────────────────
+  voltage = readVoltage();
+  current = readCurrent();
+  power   = voltage * current;
+  readColor();
+  calculateRPM();
+
+  // ── Check for incoming command from ESP32‑CAM ───────────────────
+  if (Serial2.available()) {
+    String cmd = Serial2.readStringUntil('\n');
+    cmd.trim();
+    Serial.print("Received from CAM: ");
+    Serial.println(cmd);
+
+    if (cmd == "right") {
+      Serial.println("right");   // Forward command to Arduino Nano
+      Serial.println("Forwarded 'right' to Nano");
+    }
+    // Add other commands here (e.g., "left", "stop")
+  }
+
+  // ── (Optional) Sensor debug print – comment out if not needed ──
+  // Serial.printf("V=%.2fV  I=%.3fA  P=%.2fW  | R=%lu G=%lu B=%lu [%s]  | ENC1=%.1f RPM  ENC2=%.1f RPM\n",
+  //               voltage, current, power,
+  //               rawRed, rawGreen, rawBlue, colorName.c_str(),
+  //               enc1RPM, enc2RPM);
+
+  // ── Page Rotation ───────────────────────────────────────────────
+  if (millis() - lastPageSwitch >= PAGE_DURATION_MS) {
+    currentPage = (currentPage + 1) % PAGES;
+    lastPageSwitch = millis();
+  }
+
+  // ── Display Render ──────────────────────────────────────────────
+  display.clearDisplay();
+  switch (currentPage) {
+    case PAGE_POWER:   drawPowerPage();   break;
+    case PAGE_COLOR:   drawColorPage();   break;
+    case PAGE_ENCODER: drawEncoderPage(); break;
+  }
+  display.display();
+
+  delay(500);
+}
+
+// =====================================================================
+//  RPM CALCULATION
+// =====================================================================
+void calculateRPM() {
+  unsigned long now = millis();
+  unsigned long elapsed = now - lastRpmCalc;
+  if (elapsed < RPM_INTERVAL_MS) return;
+
+  noInterrupts();
+  uint32_t c1 = enc1PulseCount;
+  uint32_t c2 = enc2PulseCount;
+  interrupts();
+
+  uint32_t pulses1 = c1 - enc1LastCount;
+  uint32_t pulses2 = c2 - enc2LastCount;
+  enc1LastCount = c1;
+  enc2LastCount = c2;
+  lastRpmCalc   = now;
+
+  float minuteFraction = elapsed / 60000.0f;
+  enc1RPM = (pulses1 / (float)ENC_PULSES_PER_REV) / minuteFraction;
+  enc2RPM = (pulses2 / (float)ENC_PULSES_PER_REV) / minuteFraction;
+}
+
+// =====================================================================
+//  SENSOR FUNCTIONS
+// =====================================================================
+
+float readVoltage() {
+  uint32_t sum = 0;
+  for (int i = 0; i < VOLTAGE_SAMPLES; i++) {
+    sum += analogRead(VOLTAGE_SENSOR_PIN);
+    delayMicroseconds(100);
+  }
+  float adcAvg   = (float)sum / VOLTAGE_SAMPLES;
+  float adcVolts = (adcAvg / ADC_RESOLUTION) * ADC_VREF;
+  return adcVolts * VOLTAGE_DIVIDER_RATIO;
+}
+
+float readCurrent() {
+  long sum = 0;
+  for (int i = 0; i < CURRENT_SAMPLES; i++) {
+    sum += analogRead(CURRENT_SENSOR_PIN);
+    delayMicroseconds(50);
+  }
+  float adcAvg     = (float)sum / CURRENT_SAMPLES;
+  float sensorVolt = (adcAvg / ADC_RESOLUTION) * ADC_VREF;
+
+  float zeroMapped = ACS712_ZERO_OFFSET * (ADC_VREF / 5.0f);
+  float amps = (sensorVolt - zeroMapped) / ACS712_SENSITIVITY;
+
+  if (fabsf(amps) < 0.05f) amps = 0.0f;
+  return amps;
+}
+
+uint32_t readTCSChannel(uint8_t s2State, uint8_t s3State) {
+  digitalWrite(TCS_S2, s2State);
+  digitalWrite(TCS_S3, s3State);
+  delayMicroseconds(300);
+  return pulseIn(TCS_OUT, LOW, TCS_TIMEOUT);
+}
+
+void readColor() {
+  rawRed   = readTCSChannel(LOW,  LOW);
+  rawGreen = readTCSChannel(HIGH, HIGH);
+  rawBlue  = readTCSChannel(LOW,  HIGH);
+
+  if (rawRed == 0 && rawGreen == 0 && rawBlue == 0) {
+    colorName = "NONE";
+    return;
+  }
+
+  uint32_t minVal = min(rawRed, min(rawGreen, rawBlue));
+
+  if      (minVal == rawRed   && rawRed   < rawGreen && rawRed   < rawBlue)  colorName = "RED";
+  else if (minVal == rawGreen && rawGreen < rawRed   && rawGreen < rawBlue)  colorName = "GREEN";
+  else if (minVal == rawBlue  && rawBlue  < rawRed   && rawBlue  < rawGreen) colorName = "BLUE";
+  else if (rawRed  < rawGreen && rawBlue  < rawGreen)                        colorName = "PURPLE";
+  else if (rawRed  < rawBlue  && rawGreen < rawBlue)                         colorName = "YELLOW";
+  else if (rawGreen < rawRed  && rawBlue  < rawRed)                          colorName = "CYAN";
+  else                                                                        colorName = "WHITE";
+}
+
+// =====================================================================
+//  DISPLAY FUNCTIONS
+// =====================================================================
+
+void splashScreen() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(10, 5);
+  display.println("  ESP32 Sensor Hub");
+
+  display.drawLine(0, 18, 127, 18, SSD1306_WHITE);
+
+  display.setCursor(5, 24);
+  display.println("ACS712  | Voltage");
+  display.setCursor(5, 34);
+  display.println("OLED    | TCS3200");
+  display.setCursor(5, 44);
+  display.println("ENC x2  | Optical");
+
+  display.drawLine(0, 54, 127, 54, SSD1306_WHITE);
+  display.setCursor(20, 57);
+  display.println("Initializing...");
+
+  display.display();
+  delay(2000);
+}
+
+void drawPageDots(uint8_t activePage) {
+  for (uint8_t i = 0; i < PAGES; i++) {
+    int x = 112 + i * 7;
+    if (i == activePage) {
+      display.fillCircle(x, 60, 2, SSD1306_WHITE);
+    } else {
+      display.drawCircle(x, 60, 2, SSD1306_WHITE);
+    }
+  }
+}
+
+void drawPowerPage() {
+  display.setTextColor(SSD1306_WHITE);
+
+  display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(1);
+  display.setCursor(22, 2);
+  display.print("POWER  MONITOR");
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 16);
+  display.print("VOLT:");
+  display.setTextSize(2);
+  display.setCursor(38, 13);
+  display.printf("%.2f", voltage);
+  display.setTextSize(1);
+  display.setCursor(110, 16);
+  display.print("V");
+
+  display.drawLine(0, 32, 127, 32, SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 36);
+  display.print("CURR:");
+  display.setTextSize(2);
+  display.setCursor(38, 33);
+  display.printf("%.2f", current);
+  display.setTextSize(1);
+  display.setCursor(110, 36);
+  display.print("A");
+
+  display.drawLine(0, 50, 127, 50, SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 54);
+  display.print("PWR:");
+  display.setCursor(30, 54);
+  display.printf("%.2f W", power);
+
+  drawPageDots(PAGE_POWER);
+}
+
+void drawColorPage() {
+  display.setTextColor(SSD1306_WHITE);
+
+  display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(1);
+  display.setCursor(22, 2);
+  display.print("COLOR  SENSOR");
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(2);
+  int nameWidth = colorName.length() * 12;
+  int nameX = (128 - nameWidth) / 2;
+  display.setCursor(nameX, 16);
+  display.print(colorName);
+
+  display.setTextSize(1);
+  display.setCursor(0, 36);
+  display.printf("R: %5lu", rawRed);
+  display.setCursor(0, 46);
+  display.printf("G: %5lu", rawGreen);
+  display.setCursor(0, 56);
+  display.printf("B: %5lu", rawBlue);
+
+  uint32_t maxVal = max(rawRed, max(rawGreen, rawBlue));
+  if (maxVal > 0) {
+    int barMaxH = 20;
+    int barW    = 10;
+    int barBase = 56;
+
+    int rBar = barMaxH - map(constrain(rawRed,   0, maxVal), 0, maxVal, 0, barMaxH);
+    int gBar = barMaxH - map(constrain(rawGreen, 0, maxVal), 0, maxVal, 0, barMaxH);
+    int bBar = barMaxH - map(constrain(rawBlue,  0, maxVal), 0, maxVal, 0, barMaxH);
+
+    display.fillRect(78,  barBase - rBar, barW, rBar, SSD1306_WHITE);
+    display.fillRect(93,  barBase - gBar, barW, gBar, SSD1306_WHITE);
+    display.fillRect(108, barBase - bBar, barW, bBar, SSD1306_WHITE);
+
+    display.setTextSize(1);
+    display.setCursor(79,  barBase + 2); display.print("R");
+    display.setCursor(94,  barBase + 2); display.print("G");
+    display.setCursor(109, barBase + 2); display.print("B");
+  }
+
+  drawPageDots(PAGE_COLOR);
+}
+
+void drawEncoderPage() {
+  display.setTextColor(SSD1306_WHITE);
+
+  display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(1);
+  display.setCursor(16, 2);
+  display.print("OPTICAL ENCODERS");
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 16);
+  display.print("ENC1 (IO21)");
+
+  display.setTextSize(2);
+  display.setCursor(0, 26);
+  display.printf("%.0f", ((enc1RPM)*2*3.14*0.0325)/60);
+  display.setTextSize(1);
+  display.setCursor(0, 42);
+  display.print("RPM");
+
+  display.setTextSize(1);
+  display.setCursor(50, 26);
+  display.printf("P:%lu", enc1LastCount);
+
+  display.drawLine(0, 50, 127, 50, SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 52);
+  display.print("ENC2 (IO35)");
+
+  display.setCursor(70, 52);
+  display.printf("%.0f RPM", ((enc2RPM)*2*3.14*0.0325)/60);
+
+  drawPageDots(PAGE_ENCODER);
+}
