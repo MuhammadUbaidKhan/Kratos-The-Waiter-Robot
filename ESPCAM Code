@@ -1,0 +1,358 @@
+/* ----------------------------------------------------------------
+   ESP32-CAM Edge Impulse FOMO – Table Number Detection
+   Triggers TURN_RIGHT when Table 1,2,3,4 is seen.
+   Saves detected frame as JPEG to SD card.
+   ---------------------------------------------------------------- */
+
+// ----- Edge Impulse library -----
+#include <Testing_phase_1_inferencing.h> 
+
+// ----- Camera & GPIO -----
+#include "esp_camera.h"
+
+// ----- SD Card -----
+#include "FS.h"
+#include "SD_MMC.h"   // ESP32-CAM uses SD_MMC (1-bit mode) on the built-in slot
+
+// AI-Thinker ESP32-CAM pin definitions
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ----- TURN_RIGHT output -----
+#define TURN_PIN          12       // GPIO that goes HIGH to turn right
+#define TURN_DURATION_MS  500      // pulse length
+#define COOLDOWN_MS       2000     // ignore detections for 2 s after a turn
+
+// ----- Inference thresholds -----
+#define DETECTION_THRESHOLD  0.6f  // minimum confidence to accept a detection
+
+// ----- SD image counter -----
+static uint32_t imgCounter = 0;
+static bool     sdReady    = false;
+
+// ----- State machine -----
+enum TurnState { IDLE, TURNING, COOLDOWN };
+TurnState state = IDLE;
+unsigned long stateStart = 0;
+
+// ----------------------------------------------------------------
+// Camera initialisation
+// ----------------------------------------------------------------
+bool setupCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;  // JPEG keeps camera buffer small
+  config.frame_size   = FRAMESIZE_QVGA; // 320x240
+  config.jpeg_quality = 12;
+  config.fb_count     = 1;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return false;
+  }
+  return true;
+}
+
+// ----------------------------------------------------------------
+// SD card initialisation (SD_MMC 1-bit mode)
+// NOTE: GPIO 4 is the SD_MMC data pin – it also drives the onboard
+//       LED. Pull it LOW after init to turn the LED off.
+// ----------------------------------------------------------------
+bool setupSD() {
+  // 1-bit mode: true = 1-bit, false = 4-bit (needs extra pins)
+  if (!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("SD card mount failed – images will NOT be saved.");
+    return false;
+  }
+  uint8_t cardType = SD_MMC.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("No SD card inserted.");
+    return false;
+  }
+  Serial.printf("SD ready. Type: %s  Size: %llu MB\n",
+                (cardType == CARD_MMC)  ? "MMC"  :
+                (cardType == CARD_SD)   ? "SDSC" :
+                (cardType == CARD_SDHC) ? "SDHC" : "UNKNOWN",
+                SD_MMC.cardSize() / (1024 * 1024));
+
+  // Turn off the flash LED that shares GPIO 4 with SD_MMC DAT0
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);
+  return true;
+}
+
+// ----------------------------------------------------------------
+// Save the raw JPEG camera buffer to SD card
+// Call BEFORE esp_camera_fb_return(fb)
+// filename: /detect_NNNN_<label>.jpg
+// ----------------------------------------------------------------
+void saveJpegToSD(camera_fb_t *fb, const char* label) {
+  if (!sdReady || fb == nullptr) return;
+
+  // Build filename  e.g. /detect_0003_Table_2.jpg
+  // Replace spaces in label with underscores for a valid filename
+  char safeLabel[32];
+  strncpy(safeLabel, label, sizeof(safeLabel) - 1);
+  safeLabel[sizeof(safeLabel) - 1] = '\0';
+  for (char *p = safeLabel; *p; p++) {
+    if (*p == ' ') *p = '_';
+  }
+
+  char path[64];
+  snprintf(path, sizeof(path), "/detect_%04u_%s.jpg", imgCounter++, safeLabel);
+
+  File file = SD_MMC.open(path, FILE_WRITE);
+  if (!file) {
+    Serial.printf("SD: failed to open %s for writing\n", path);
+    return;
+  }
+
+  size_t written = file.write(fb->buf, fb->len);
+  file.close();
+
+  if (written == fb->len) {
+    Serial.printf("SD: saved %s (%u bytes)\n", path, written);
+  } else {
+    Serial.printf("SD: partial write %u / %u bytes\n", written, fb->len);
+  }
+}
+
+// ----------------------------------------------------------------
+// Crop & resize the camera frame to the model input size (square)
+// The camera buffer is JPEG – we need a decoded grayscale plane.
+// Edge Impulse's FOMO expects grayscale or RGB; here we decode to
+// grayscale using the built-in esp_jpg_decode helper.
+// ----------------------------------------------------------------
+
+// Callback struct for the decoder
+struct DecodeState {
+  uint8_t *out;
+  int      out_w;
+  int      out_h;
+  int      src_w;
+  int      src_h;
+};
+
+// jpg2rgb888 output callback – receives one MCU row at a time
+static bool jpgDecodeCallback(void *arg, size_t index, const uint8_t *data, size_t len) {
+  // We won't use this path – use ei_camera_get_data instead (see below).
+  return true;
+}
+
+// Simpler approach: decode JPEG to RGB, then down-sample to model size.
+// esp_camera provides esp_camera_fb_get() which for PIXFORMAT_JPEG gives
+// compressed bytes.  We use fmt2rgb888 from the camera library.
+bool cropAndResize(camera_fb_t *fb, uint8_t *out_buf) {
+  const int input_w = EI_CLASSIFIER_INPUT_WIDTH;
+  const int input_h = EI_CLASSIFIER_INPUT_HEIGHT;
+  const int src_w   = 320;
+  const int src_h   = 240;
+
+  // Decode JPEG → RGB888
+  uint8_t *rgb_buf = (uint8_t*)malloc(src_w * src_h * 3);
+  if (!rgb_buf) return false;
+
+  bool ok = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb_buf);
+  if (!ok) {
+    free(rgb_buf);
+    return false;
+  }
+
+  // Crop a centred square
+  int crop  = (src_w < src_h) ? src_w : src_h;  // 240
+  int off_x = (src_w - crop) / 2;               // 40
+  int off_y = (src_h - crop) / 2;               // 0
+
+  // Nearest-neighbour resize + convert to grayscale
+  for (int y = 0; y < input_h; y++) {
+    for (int x = 0; x < input_w; x++) {
+      int sx = off_x + (x * crop / input_w);
+      int sy = off_y + (y * crop / input_h);
+      int idx = (sy * src_w + sx) * 3;
+      // BT.601 luminance
+      uint8_t gray = (uint8_t)(0.299f * rgb_buf[idx]
+                              + 0.587f * rgb_buf[idx + 1]
+                              + 0.114f * rgb_buf[idx + 2]);
+      out_buf[y * input_w + x] = gray;
+    }
+  }
+  free(rgb_buf);
+  return true;
+}
+
+// ----------------------------------------------------------------
+// Check if a label belongs to any "Table X"
+// ----------------------------------------------------------------
+bool isTableLabel(const char* label) {
+  return (strncmp(label, "Table ", 6) == 0);
+}
+
+// ----------------------------------------------------------------
+// Global pointer needed by run_classifier callback
+// ----------------------------------------------------------------
+uint8_t *ei_camera_snapshot = nullptr;
+
+int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
+  for (size_t i = 0; i < length; i++) {
+    out_ptr[i] = ei_camera_snapshot[offset + i] / 255.0f;
+  }
+  return 0;
+}
+
+// ----------------------------------------------------------------
+// Setup
+// ----------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("ESP32-CAM Table Detection – TURN_RIGHT + SD save");
+
+  pinMode(TURN_PIN, OUTPUT);
+  digitalWrite(TURN_PIN, LOW);
+
+  if (!setupCamera()) {
+    Serial.println("Camera failed – check connections and GPIO.");
+    while (1) delay(1000);
+  }
+  Serial.println("Camera ready.");
+
+  sdReady = setupSD();
+}
+
+// ----------------------------------------------------------------
+// Main loop
+// ----------------------------------------------------------------
+void loop() {
+  // ---- 1. Capture frame ----
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    delay(100);
+    return;
+  }
+
+  // ---- 2. Prepare cropped grayscale buffer for the model ----
+  const int input_size = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+  uint8_t *snapshot_buf = (uint8_t*)malloc(input_size);
+  if (!snapshot_buf) {
+    esp_camera_fb_return(fb);
+    Serial.println("Memory allocation failed");
+    return;
+  }
+
+  bool resizeOk = cropAndResize(fb, snapshot_buf);
+  if (!resizeOk) {
+    free(snapshot_buf);
+    esp_camera_fb_return(fb);
+    Serial.println("Frame decode/resize failed");
+    return;
+  }
+
+  // ---- 3. Run inference ----
+  ei_impulse_result_t result = { 0 };
+  signal_t signal;
+  signal.total_length = input_size;
+  signal.get_data     = &ei_camera_get_data;
+  ei_camera_snapshot  = snapshot_buf;
+
+  EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
+  free(snapshot_buf);
+
+  if (err != EI_IMPULSE_OK) {
+    esp_camera_fb_return(fb);
+    Serial.printf("Inference error: %d\n", err);
+    return;
+  }
+
+  // ---- 4. Process detections ----
+  bool        tableDetected = false;
+  const char *bestLabel     = "";
+  float       bestScore     = 0.0f;
+
+  for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
+    auto &bb = result.bounding_boxes[i];
+    if (bb.value < DETECTION_THRESHOLD) continue;
+    if (!isTableLabel(bb.label))        continue;
+
+    Serial.printf("Detected: %s (%.2f) at (%d,%d) %dx%d\n",
+                  bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
+
+    tableDetected = true;
+    if (bb.value > bestScore) {        // keep highest-confidence label
+      bestScore = bb.value;
+      bestLabel = bb.label;
+    }
+  }
+
+  // ---- 5. Save JPEG to SD if a table was detected ----
+  //         Do this while fb is still valid, BEFORE returning it.
+  if (tableDetected && state == IDLE) {
+    saveJpegToSD(fb, bestLabel);
+  }
+
+  // ---- 6. Release camera buffer ----
+  esp_camera_fb_return(fb);
+
+  // ---- 7. TURN_RIGHT state machine ----
+  unsigned long now = millis();
+
+  switch (state) {
+    case IDLE:
+      if (tableDetected) {
+        digitalWrite(TURN_PIN, HIGH);
+        Serial.println("TURN_RIGHT");
+        state      = TURNING;
+        stateStart = now;
+      }
+      break;
+
+    case TURNING:
+      if (now - stateStart >= TURN_DURATION_MS) {
+        digitalWrite(TURN_PIN, LOW);
+        state      = COOLDOWN;
+        stateStart = now;
+      }
+      break;
+
+    case COOLDOWN:
+      if (now - stateStart >= COOLDOWN_MS) {
+        state = IDLE;
+      }
+      break;
+  }
+
+  delay(10);  // small yield to avoid watchdog issues
+}
